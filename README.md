@@ -14,7 +14,7 @@ optional arguments:
   --bpjit BPJIT      set breakpoint on JIT functions by name
   --lnjit LNJIT      displays JIT symbols at or near given address
   --export_embedded  export embedded content
-``
+```
 
 ## How to trace JIT function?
 ```
