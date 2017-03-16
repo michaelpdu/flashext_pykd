@@ -1,6 +1,9 @@
 # flashext_pykd
 WinDBG PYKD Python Extension for Flash Debugging - FlashExt
 
+This project is a python version of previous C++ flashext
+[https://github.com/michaelpdu/flashext](https://github.com/michaelpdu/flashext)
+
 ## How to show help information?
 ```
 0:000> !py -g flashext.py --help
