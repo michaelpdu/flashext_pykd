@@ -1,5 +1,6 @@
 from pykd import *
 import argparse
+import os
 
 global addr_flash_base
 global len_flash_range
@@ -7,14 +8,22 @@ global addr_parse
 global addr_getmethodname
 global addr_setjit
 global addr_unused_memory
+global addr_process_embedded_flash
 global is_modified_setjit
 # save JIT method map <address, method name>
 global map_jit_bp
+#
+global event_handler
 
 if not 'is_modified_setjit' in vars():
     # dprintln("is_modified_setjit is undefined, set it as False")
     global is_modified_setjit
     is_modified_setjit = False
+
+if not 'event_handler' in vars():
+    # dprintln("is_modified_setjit is undefined, set it as False")
+    global event_handler
+    event_handler = None
 
 def get_flash_module_base_address():
     base_addr = 0
@@ -146,11 +155,36 @@ def search_unused_memory():
     if addr_unused_memory == 0:
         raise Exception('Cannot get address of hook point: Unused Memory')
 
+def search_sig_process_embedded_flash():
+    # .text:1012AF60 55                                            push    ebp
+    # .text:1012AF61 8D 6C 24 94                                   lea     ebp, [esp-6Ch]
+    # .text:1012AF65 81 EC FC 00 00 00                             sub     esp, 0FCh
+    # .text:1012AF6B 53                                            push    ebx
+    # .text:1012AF6C 56                                            push    esi
+    # .text:1012AF6D 57                                            push    edi
+    # .text:1012AF6E 8B F9                                         mov     edi, ecx
+    # .text:1012AF70 C7 45 18 00 00 00 00                          mov     [ebp+6Ch+var_54], 0
+    # .text:1012AF77 80 7D 7C 00                                   cmp     [ebp+6Ch+arg_8], 0
+    # .text:1012AF7B 89 7D 50                                      mov     [ebp+6Ch+var_1C], edi
+    # .text:1012AF7E 74 08                                         jz      short loc_1012AF88
+    # .text:1012AF80 8B 4F 38                                      mov     ecx, [edi+38h]
+    # .text:1012AF83 E8 C8 40 01 00                                call    sub_1013F050
+    # 
+    # s 10000000 L?111e000 55 8D 6C 24 94 81 EC FC 00 00 00 53 56 57 8B F9
+    dprintln("search signature of process embedded flash ...")
+    output = dbgCommand("s %s L%s 55 8D 6C 24 94 81 EC FC 00 00 00 53 56 57 8B F9" % (hex(addr_flash_base), hex(len_flash_range)))
+    global addr_process_embedded_flash
+    addr_process_embedded_flash = parse_search_result(output)
+    dprintln("Address of process embedded flash is: " + hex(addr_process_embedded_flash))
+    if addr_process_embedded_flash == 0:
+        raise Exception('Cannot get address of hook point: Process Embedded Flash')
+
 def search_hook_points():
     # search_sig_parse()
     search_sig_getmethodname()
     search_sig_setjit()
     search_unused_memory()
+    search_sig_process_embedded_flash()
 
 def calc_offset(cur_addr, target_addr):
     if abs(target_addr-cur_addr) <= 5:
@@ -248,13 +282,45 @@ def find_near_jit_symbol(checked_addr):
             print "Find exact matched symbol: " + map_jit_bp[addr]
             return
 
+def dump_content_by_writemem(dest_folder, start_addr, length):
+    # .writemem c:\memory_0606b000.swf_ 0606b000 L0x14543
+    cmd = '.writemem ' + os.path.join(dest_folder, 'memory_' + hex(start_addr) + '.swf ') + hex(start_addr) + ' L' + hex(length)
+    print cmd
+    dbgCommand(cmd)
+
+def dump_flash_in_memory(dest_folder):
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+    output = dbgCommand("s -a 0 L?7FFFFFF \"FWS\"")
+    if None != output:
+        for line in output.split('\n'):
+            if len(line) != 0:
+                arr = line.split('-')[0].split(' ')
+                start_addr = int(arr[0], 16)
+                flash_len = int(arr[9],16)*0x1000000 + int(arr[8],16)*0x10000 + int(arr[7],16)*0x100 + int(arr[6],16)
+                print "addr: " + hex(start_addr) + ", len: " + hex(flash_len)
+                dump_content_by_writemem(dest_folder, start_addr, flash_len)
+    else:
+        dprintln("Cannot find any flash in memory")
+
+
 class HookPointHandler(pykd.eventHandler):
     """
     """
     def __init__(self):
         #self.bp_parse = setBp(addr_parse, self.callback_parse)
-        self.bp_getmethodname = setBp(addr_getmethodname, self.callback_getmethodname)
+        #self.bp_getmethodname = setBp(addr_getmethodname, self.callback_getmethodname)
         self.bp_setjit = setBp(addr_setjit, self.callback_setjit)
+        self.bp_process_embedded_flash = setBp(addr_process_embedded_flash, self.callback_process_embedded_flash)
+        self.need_dump_embedded_flash = False
+        self.find_jit_load_bytes = False
+        self.dest_folder = 'c:\\temp'
+
+    def export_embedded_flash(self, status):
+        self.need_dump_embedded_flash = True
+
+    def set_dest_folder_for_dumpping(self, dest_folder):
+        self.dest_folder = dest_folder
 
     def set_bp_after_getmethodname(self):
         if not is_modified_setjit:
@@ -276,19 +342,27 @@ class HookPointHandler(pykd.eventHandler):
     def callback_parse(self):
         dprintln("Enter into callback_parse")
     
-    def callback_getmethodname(self):
-        # dprintln("Enter into callback_getmethodname")
-        pass
+    #def callback_getmethodname(self):
+    #    # dprintln("Enter into callback_getmethodname")
+    #    pass
 
     def callback_after_call_getmethodname(self):
         # dprintln("Enter into callback_after_call_getmethodname")   
         reg_eax = reg("eax")   
         # dprintln("EAX = " + hex(reg_eax))
         addr_name = ptrPtr(reg_eax+0x08)
-        if 0 != addr_name:
+        len_name = ptrPtr(reg_eax+0x10)
+        if 0 != addr_name and 0 != len_name:
             jit_method_addr = reg("ecx")
-            jit_method_name = loadCStr(addr_name)
+            jit_method_name = loadChars(addr_name, len_name)
             dprintln("Method Address: " + hex(jit_method_addr) + ", Method Name: " + jit_method_name)
+            # set breakpoint at JITed functions
+            self.bp_jit_function = setBp(jit_method_addr, self.callback_jit_function)
+            # why checking jit method name is "flash.display::Loader/loadBytes"?
+            # this is condition for dumpping embedded flash
+            if jit_method_name == "flash.display::Loader/loadBytes":
+                self.find_jit_load_bytes = True
+            # set breakpoint according to JITed function name
             global map_jit_bp
             map_jit_bp[jit_method_addr] = jit_method_name
             if is_monitoring_jit_function(jit_method_name):
@@ -301,13 +375,46 @@ class HookPointHandler(pykd.eventHandler):
             if is_modified_setjit:
                 self.set_bp_after_getmethodname()
 
+    def setbp_virtual_protect(self):
+        output = dbgCommand("x kernel32!virtualprotect")
+        addr_virtual_protect = parse_search_result(output, 0)
+        print "Address of VirtualProtect: " + hex(addr_virtual_protect)
+        self.bp_virtual_protect = setBp(addr_virtual_protect, self.callback_virtual_protect)
+
+    def callback_virtual_protect(self):
+        print dbgCommand("dd esp L8")
+        print dbgCommand("kv L10")
+
+    def callback_jit_function(self):
+        # r eip
+        output = dbgCommand("r eip")
+        addr_eip = int(output.split('\n')[0].split('=')[1],16)
+        print "> " + map_jit_bp[addr_eip]
+        #print dbgCommand("u eip L10")
+        print dbgCommand("dd esp L4")
+
+    def callback_process_embedded_flash(self):
+        if not os.path.exists(self.dest_folder):
+            os.makedirs(self.dest_folder)
+        # dump content to dest_folder when self.find_jit_load_bytes and self.need_dump_embedded_flash are true
+        if self.need_dump_embedded_flash and self.find_jit_load_bytes:
+            # poi(ESP+4): address of embedded content
+            # poi(ESP+8): length of embedded content
+            reg_esp = reg("esp")   
+            content_addr = ptrPtr(reg_esp+0x04)
+            content_len = ptrPtr(reg_esp+0x08)
+            dump_content_by_writemem(self.dest_folder, content_addr, content_len)
 
 parser = argparse.ArgumentParser("WinDBG PYKD Python Extension - FlashExt")
 parser.add_argument("--tjit", action="store_true", help="trace JIT functions")
-parser.add_argument("--bpjit", type=str, help="set breakpoint on JIT functions by name")
-parser.add_argument("--lnjit", type=lambda x: hex(int(x,0)), help="displays JIT symbols at or near given address")
-parser.add_argument("--export_embedded", action="store_true", help="export embedded content")
+parser.add_argument("--bpjit", type=str, metavar='jit_function_name', help="set breakpoint on JIT functions by name")
+parser.add_argument("--lnjit", type=lambda x: hex(int(x,0)), metavar='address', help="displays JIT symbols at or near given address")
+parser.add_argument("--export_embedded", type=str, metavar='dest_folder', help="export embedded content")
+parser.add_argument("--dump_flash_in_memory", type=str, metavar='dest_folder', help="dump all of flash file in memory")
+parser.add_argument("--monitor_virtual_protect", action="store_true", help="monitor virtual protect")
 args = parser.parse_args()
+
+
 if args.tjit:
     dprintln("Trace JIT Functions ...")
     search_base_address()
@@ -315,16 +422,28 @@ if args.tjit:
     HookPointHandler()
     go()
 elif args.bpjit:
-    dprintln("set breakpoint at \"" + args.bpjit + "\"")
+    dprintln("Set breakpoint at \"" + args.bpjit + "\"")
     search_base_address()
     search_hook_points()
-    HookPointHandler()
+    if event_handler == None:
+        #global event_handler
+        event_handler = HookPointHandler()
     monitor_jit_funtion(args.bpjit)
     go()
 elif args.lnjit:
-    dprintln("list near symbol at: " + args.lnjit)
+    dprintln("List near symbol at: " + args.lnjit)
     find_near_jit_symbol(int(args.lnjit, 16))
 elif args.export_embedded:
-    pass
+    dprintln("Dump embedded flash to: " + args.export_embedded)
+    search_base_address()
+    search_hook_points()
+    handler = HookPointHandler()
+    handler.dump_embedded_flash(True)
+    go()
+elif args.dump_flash_in_memory:
+    dprintln("Dump flash to: " + args.dump_flash_in_memory)
+    dump_flash_in_memory(args.dump_flash_in_memory)
+elif args.monitor_virtual_protect:
+    event_handler.setbp_virtual_protect()
 else:
     parser.print_help()
